@@ -310,7 +310,12 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
     # Head of Technology — builds and operates systems. Security tools
     # (port_scan, subdomain_enumerate, etc.) are intentionally NOT in the
     # default — users opt in via the Tool Library when an engagement
-    # actually needs reconnaissance.
+    # actually needs reconnaissance. OAuth-bound categories (email,
+    # github, slack, …) are likewise opt-in: defining them implicitly
+    # would either spam the prompt with disconnected tools the worker
+    # can't actually call, or — once authorized — expose data sources
+    # the user never asked the queen to touch. Users add OAuth
+    # categories per-queen via the Tool Library.
     "queen_technology": [
         "file_ops",
         "terminal_basic",
@@ -319,9 +324,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "research",
         "context_awareness",
         "charts",
-        "email_oauth",
-        "github_oauth",
-        "slack_oauth",
     ],
     # Head of Growth — data, experiments, competitor research; no security.
     "queen_growth": [
@@ -332,9 +334,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "research",
         "context_awareness",
         "charts",
-        "email_oauth",
-        "slack_oauth",
-        "hubspot_oauth",
     ],
     # Head of Product Strategy — user research + roadmaps; no security.
     "queen_product_strategy": [
@@ -345,9 +344,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "research",
         "context_awareness",
         "charts",
-        "email_oauth",
-        "notion_oauth",
-        "slack_oauth",
     ],
     # Head of Finance — financial models (CSV/Excel heavy), market research.
     "queen_finance_fundraising": [
@@ -359,9 +355,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "research",
         "context_awareness",
         "charts",
-        "email_oauth",
-        "google_workspace",
-        "hubspot_oauth",
     ],
     # Head of Legal — reads contracts/PDFs, researches; no data/security.
     "queen_legal": [
@@ -371,8 +364,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "browser_interaction",
         "research",
         "context_awareness",
-        "email_oauth",
-        "google_workspace",
     ],
     # Head of Brand & Design — visual refs, style guides; no data/security.
     "queen_brand_design": [
@@ -382,8 +373,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "browser_interaction",
         "research",
         "context_awareness",
-        "email_oauth",
-        "notion_oauth",
     ],
     # Head of Marketing — positioning, content, competitor research, campaign
     # performance. Charts included for funnel/audience reporting; no security.
@@ -404,9 +393,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "browser_interaction",
         "research",
         "context_awareness",
-        "email_oauth",
-        "slack_oauth",
-        "notion_oauth",
     ],
     # Head of Operations — processes, automation, observability.
     "queen_operations": [
@@ -417,11 +403,6 @@ QUEEN_DEFAULT_CATEGORIES: dict[str, list[str]] = {
         "browser_interaction",
         "context_awareness",
         "charts",
-        "email_oauth",
-        "calendar_oauth",
-        "slack_oauth",
-        "notion_oauth",
-        "hubspot_oauth",
     ],
 }
 
@@ -474,6 +455,30 @@ def resolve_category_tools(
     return names
 
 
+def _credentialed_tool_names() -> set[str]:
+    """Return the set of MCP tool names that are bound to an OAuth provider.
+
+    Reads the credential adapter so the answer reflects every provider
+    declared in ``CREDENTIAL_SPECS`` (Gmail, GitHub, Notion, …) without
+    needing the live MCP catalog. Falls back to an empty set if
+    ``aden_tools`` is unavailable so the rest of the resolver keeps
+    working in stripped-down test environments.
+    """
+    try:
+        from aden_tools.credentials.store_adapter import CredentialStoreAdapter
+
+        return {
+            name
+            for name, provider in CredentialStoreAdapter.default()
+            .get_tool_provider_map()
+            .items()
+            if provider
+        }
+    except Exception:
+        logger.debug("Provider map unavailable for default-tools filter", exc_info=True)
+        return set()
+
+
 def resolve_queen_default_tools(
     queen_id: str,
     mcp_catalog: dict[str, list[dict[str, Any]]] | None = None,
@@ -483,25 +488,61 @@ def resolve_queen_default_tools(
     Arguments:
         queen_id: Profile ID (e.g. ``"queen_technology"``).
         mcp_catalog: Optional mapping of ``{server_name: [{"name": ...}, ...]}``
-            used to expand ``@server:NAME`` shorthands in categories.
-            When absent, shorthand entries are dropped and the result
-            contains only the explicitly-named tools.
+            used to expand ``@server:NAME`` shorthands in categories AND
+            to enumerate credential-less tools for the unknown-queen
+            fallback. When absent, shorthand entries are dropped and the
+            unknown-queen fallback returns ``None`` (legacy "allow all").
 
     Returns:
-        A deduplicated list of tool names, or ``None`` if the queen has
-        no role entry (caller should treat as "allow every MCP tool").
+        A deduplicated list of tool names. OAuth-credentialed tools are
+        always excluded from the default — for known queens because
+        none of the role categories contain them, for unknown queens
+        because the unknown-queen fallback (when given a catalog)
+        explicitly drops every name with a provider. Users opt OAuth
+        tools in per-queen via the Tool Library; that save writes a
+        sidecar which then takes precedence over this function.
+
+        Returns ``None`` only when the queen is unknown AND no catalog
+        was supplied — preserving the legacy "allow every MCP tool"
+        path for environments that can't enumerate the catalog.
     """
+    credentialed = _credentialed_tool_names()
     categories = QUEEN_DEFAULT_CATEGORIES.get(queen_id)
     if not categories:
-        return None
+        # Unknown queen — fall back to "every credential-less MCP tool"
+        # when we have a catalog to enumerate from. Without a catalog
+        # there's nothing to filter against, so preserve the legacy
+        # ``None`` (allow-all) so we don't accidentally lock the queen
+        # out of every tool in stripped-down boot paths.
+        if mcp_catalog is None:
+            return None
+        names: list[str] = []
+        seen: set[str] = set()
+        for entries in mcp_catalog.values():
+            for tool in entries or []:
+                tname = tool.get("name") if isinstance(tool, dict) else None
+                if not tname or tname in seen:
+                    continue
+                if tname in credentialed:
+                    continue
+                seen.add(tname)
+                names.append(tname)
+        return names
 
-    names: list[str] = []
-    seen: set[str] = set()
+    names = []
+    seen = set()
 
     def _add(name: str) -> None:
-        if name and name not in seen:
-            seen.add(name)
-            names.append(name)
+        if not name or name in seen:
+            return
+        # Belt-and-braces: even if a category accidentally references a
+        # credentialed tool (e.g. via ``@server:hive_tools`` picking up
+        # gmail_*), drop it from the default. OAuth tools are opt-in
+        # everywhere — users add them per-queen via the Tool Library.
+        if name in credentialed:
+            return
+        seen.add(name)
+        names.append(name)
 
     for cat in categories:
         for entry in _TOOL_CATEGORIES.get(cat, []):
