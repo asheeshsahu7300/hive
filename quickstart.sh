@@ -1476,7 +1476,7 @@ case $choice in
         SUBSCRIPTION_MODE="hive_llm"
         apply_preset "hive_llm"
         PROVIDER_NAME="Hive"
-        SIGNUP_URL="https://discord.com/invite/hQdU7QDkgR"
+        SIGNUP_URL="https://discord.com/invite/MXE49hrKDk"
         echo ""
         echo -e "${GREEN}⬢${NC} Using Hive LLM"
         echo ""
